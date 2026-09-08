@@ -9,7 +9,10 @@ Works both **standalone** (via direct WebUSB HID communication) and **seamlessly
 ## 📸 Screenshots
 
 ### Custom Frameless Settings UI
-![Settings UI](assets/screenshots/frameless_settings_mockup.png)
+![Settings UI](assets/screenshots/settings_window.png)
+
+### System Tray Context Menu & Live Style Selector
+![Tray Context Menu](assets/screenshots/tray_context_menu.png)
 
 ### 7 Available Taskbar Icon Styles
 ![All 7 UI Styles Preview](assets/screenshots/all_styles_taskbar_preview.png)

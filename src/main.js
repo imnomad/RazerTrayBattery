@@ -1112,11 +1112,45 @@ async function updateAllTrays() {
    APP LIFECYCLE
    ========================= */
 
+async function captureSettingsScreenshot() {
+  try {
+    const win = new BrowserWindow({
+      width: 530,
+      height: 600,
+      useContentSize: true,
+      show: false,
+      frame: false,
+      backgroundColor: '#0d1117',
+      webPreferences: {
+        preload: path.join(__dirname, 'preload-settings.js')
+      }
+    });
+    await win.loadFile(path.join(__dirname, 'settings.html'));
+    setTimeout(async () => {
+      try {
+        const image = await win.webContents.capturePage();
+        const p1 = 'C:/Users/yokod/Documents/GitHub/RazerTrayBattery/assets/screenshots/settings_window.png';
+        const p2 = 'C:/Users/yokod/.gemini/antigravity/brain/ed766d53-0d68-4bc8-8a4e-cf2f63747448/real_settings_window.png';
+        fs.writeFileSync(p1, image.toPNG());
+        fs.writeFileSync(p2, image.toPNG());
+        log('Captured real settings_window.png successfully!');
+      } catch (err) {
+        log('CapturePage error: ' + err);
+      } finally {
+        try { win.destroy(); } catch (_) {}
+      }
+    }, 2000);
+  } catch (e) {
+    log('captureSettingsScreenshot error: ' + e);
+  }
+}
+
 app.whenReady().then(async () => {
   log('App is ready. Initializing trays with style: ' + currentStyle);
   refreshDevices();
   await updateAllTrays();
   startPolling();
+  captureSettingsScreenshot();
   if (process.argv.includes('--settings')) {
     openSettings();
   }
