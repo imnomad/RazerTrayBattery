@@ -40,6 +40,7 @@ process.on('unhandledRejection', (err) => log('UnhandledRejection: ' + (err && e
 
 const devices = new Map();
 const trays = new Map(); // device.key -> Tray, or 'single' -> Tray
+const batteryCache = new Map(); // canonicalKey -> { percent, charging, timestamp }
 let settingsWindow = null;
 let pollTimer = null;
 
@@ -592,43 +593,76 @@ function createDeviceIcon(deviceType, percent, charging) {
 
 function readSynapseBatteries() {
   try {
-    const logPath = path.join(
+    const logsDir = path.join(
       process.env.LOCALAPPDATA || '',
       'Razer',
       'RazerAppEngine',
       'User Data',
-      'Logs',
-      'systray_systrayv2.log'
+      'Logs'
     );
-    if (!fs.existsSync(logPath)) return {};
+    if (!fs.existsSync(logsDir)) return {};
 
-    const stat = fs.statSync(logPath);
-    const readSize = Math.min(stat.size, 128 * 1024);
-    const buffer = Buffer.alloc(readSize);
-    const fd = fs.openSync(logPath, 'r');
-    fs.readSync(fd, buffer, 0, readSize, stat.size - readSize);
-    fs.closeSync(fd);
+    // Find all systray log files (systray_systrayv2.log, systray_systrayv21.log, etc.)
+    const files = fs.readdirSync(logsDir)
+      .filter(f => f.toLowerCase().startsWith('systray_systray') && f.toLowerCase().endsWith('.log'))
+      .map(f => {
+        const full = path.join(logsDir, f);
+        try {
+          const stat = fs.statSync(full);
+          return { full, mtime: stat.mtimeMs, size: stat.size };
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.mtime - a.mtime);
 
-    const content = buffer.toString('utf-8');
-    const lines = content.split('\n');
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (lines[i].includes('mapDevices ~ devices:')) {
-        const idx = lines[i].indexOf('mapDevices ~ devices:');
-        const raw = lines[i].slice(idx + 'mapDevices ~ devices:'.length).trim();
-        const parsed = JSON.parse(raw);
-        const result = {};
-        for (const item of parsed) {
-          if (item.hasBattery && item.powerStatus) {
-            result[item.productId] = {
-              level: item.powerStatus.level,
-              charging: item.powerStatus.chargingStatus === 'Charging',
-              name: item.name?.en || item.productName?.en
-            };
+    if (files.length === 0) return {};
+
+    const result = {};
+
+    // Read up to 3 most recently modified systray logs
+    for (const fileObj of files.slice(0, 3)) {
+      try {
+        const readSize = Math.min(fileObj.size, 512 * 1024);
+        if (readSize <= 0) continue;
+        const buffer = Buffer.alloc(readSize);
+        const fd = fs.openSync(fileObj.full, 'r');
+        fs.readSync(fd, buffer, 0, readSize, fileObj.size - readSize);
+        fs.closeSync(fd);
+
+        const content = buffer.toString('utf-8');
+        const lines = content.split('\n');
+        for (let i = lines.length - 1; i >= 0; i--) {
+          if (lines[i].includes('mapDevices ~ devices:')) {
+            const idx = lines[i].indexOf('mapDevices ~ devices:');
+            const raw = lines[i].slice(idx + 'mapDevices ~ devices:'.length).trim();
+            try {
+              const parsed = JSON.parse(raw);
+              for (const item of parsed) {
+                if (item && item.hasBattery && item.powerStatus && item.productId) {
+                  if (!result[item.productId]) {
+                    result[item.productId] = {
+                      level: item.powerStatus.level,
+                      charging: item.powerStatus.chargingStatus === 'Charging',
+                      name: item.name?.en || item.productName?.en,
+                      productId: item.productId
+                    };
+                  }
+                }
+              }
+            } catch (_) {}
+            if (Object.keys(result).length > 0) {
+              break;
+            }
           }
         }
-        return result;
-      }
+      } catch (_) {}
+
+      if (Object.keys(result).length > 0) break;
     }
+
+    return result;
   } catch (_) {}
   return {};
 }
@@ -732,7 +766,7 @@ function getDeviceCanonicalKey(name, vendorId, productId) {
 }
 
 function refreshDevices() {
-  devices.clear();
+  const nextDevices = new Map();
 
   // 1. Scan HID devices connected via USB
   const list = HID.devices().filter(d => d.vendorId === RAZER_VENDOR_ID);
@@ -751,10 +785,10 @@ function refreshDevices() {
 
     const canonicalKey = getDeviceCanonicalKey(name, d.vendorId, d.productId);
 
-    if (!devices.has(canonicalKey)) {
+    if (!nextDevices.has(canonicalKey)) {
       const lower = name.toLowerCase();
       const isKnownNonBattery = lower.includes('kiyo') || lower.includes('essential') || lower.includes('camera') || lower.includes('dock');
-      devices.set(canonicalKey, {
+      nextDevices.set(canonicalKey, {
         key: canonicalKey,
         vendorId: d.vendorId,
         productId: d.productId,
@@ -771,9 +805,9 @@ function refreshDevices() {
     const pid = Number(pidStr);
     const devName = item.name || 'Razer Device';
     const canonicalKey = getDeviceCanonicalKey(devName, RAZER_VENDOR_ID, pid);
-    if (!devices.has(canonicalKey)) {
+    if (!nextDevices.has(canonicalKey)) {
       const deviceType = classifyDevice(devName, pid);
-      devices.set(canonicalKey, {
+      nextDevices.set(canonicalKey, {
         key: canonicalKey,
         vendorId: RAZER_VENDOR_ID,
         productId: pid,
@@ -782,6 +816,11 @@ function refreshDevices() {
         hasBattery: true
       });
     }
+  }
+
+  devices.clear();
+  for (const [k, v] of nextDevices) {
+    devices.set(k, v);
   }
 }
 
@@ -800,19 +839,32 @@ async function getDeviceBattery(device) {
     if (!item || item.level === undefined) continue;
     const itemCanonical = getDeviceCanonicalKey(item.name, RAZER_VENDOR_ID, item.productId);
     if (itemCanonical === devCanonical || item.productId === device.productId) {
-      return {
+      const res = {
         percent: item.level,
         charging: item.charging
       };
+      batteryCache.set(device.key, { ...res, timestamp: Date.now() });
+      return res;
     }
   }
 
   // 2. Direct WebUSB communication fallback
   const direct = await readBatteryWebUSB(device);
   if (direct != null) {
-    return {
+    const res = {
       percent: direct,
       charging: false
+    };
+    batteryCache.set(device.key, { ...res, timestamp: Date.now() });
+    return res;
+  }
+
+  // 3. Cached battery fallback if device is still connected
+  const cached = batteryCache.get(device.key);
+  if (cached && (Date.now() - cached.timestamp < 24 * 60 * 60 * 1000)) {
+    return {
+      percent: cached.percent,
+      charging: cached.charging
     };
   }
 
@@ -1105,62 +1157,38 @@ async function updateAllTrays() {
     tray.setContextMenu(createContextMenuForDevice(device, device.percent, device.charging));
   }
 
-  log('Updated trays for: ' + listWithBat.map(d => d.productName).join(', '));
+  log('Updated trays for: ' + listWithBat.map(d => `${d.productName} (${d.percent}%${d.charging ? ', charging' : ''})`).join(', '));
 }
 
 /* =========================
    APP LIFECYCLE
    ========================= */
 
-async function captureSettingsScreenshot() {
-  try {
-    const win = new BrowserWindow({
-      width: 530,
-      height: 600,
-      useContentSize: true,
-      show: false,
-      frame: false,
-      backgroundColor: '#0d1117',
-      webPreferences: {
-        preload: path.join(__dirname, 'preload-settings.js')
-      }
-    });
-    await win.loadFile(path.join(__dirname, 'settings.html'));
-    setTimeout(async () => {
-      try {
-        const image = await win.webContents.capturePage();
-        const p1 = 'C:/Users/yokod/Documents/GitHub/RazerTrayBattery/assets/screenshots/settings_window.png';
-        const p2 = 'C:/Users/yokod/.gemini/antigravity/brain/ed766d53-0d68-4bc8-8a4e-cf2f63747448/real_settings_window.png';
-        fs.writeFileSync(p1, image.toPNG());
-        fs.writeFileSync(p2, image.toPNG());
-        log('Captured real settings_window.png successfully!');
-      } catch (err) {
-        log('CapturePage error: ' + err);
-      } finally {
-        try { win.destroy(); } catch (_) {}
-      }
-    }, 2000);
-  } catch (e) {
-    log('captureSettingsScreenshot error: ' + e);
-  }
-}
-
 app.whenReady().then(async () => {
   log('App is ready. Initializing trays with style: ' + currentStyle);
   refreshDevices();
   await updateAllTrays();
   startPolling();
-  captureSettingsScreenshot();
   if (process.argv.includes('--settings')) {
     openSettings();
   }
 });
 
 app.on('window-all-closed', (e) => e.preventDefault());
+app.on('before-quit', () => log('Event: before-quit'));
+app.on('will-quit', () => log('Event: will-quit'));
+app.on('quit', (_e, code) => log('Event: quit with code ' + code));
+process.on('exit', (code) => log('Process exit with code ' + code));
 
+let pollCount = 0;
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
+  pollCount = 0;
   pollTimer = setInterval(async () => {
+    pollCount++;
+    if (pollCount % 4 === 0) {
+      refreshDevices();
+    }
     await updateAllTrays();
   }, 15000);
 }
@@ -1270,7 +1298,9 @@ async function readBatteryWebUSB(info) {
           d.vendorId === info.vendorId &&
           (d.productId === info.productId ||
            (info.productId === 0x00e6 && d.productId === 0x00e5) ||
-           (info.productId === 0x00e5 && d.productId === 0x00e6))
+           (info.productId === 0x00e5 && d.productId === 0x00e6) ||
+           (info.productId === 0x027b && d.productId === 0x0277) ||
+           (info.productId === 0x0277 && d.productId === 0x027b))
         )
     });
 
