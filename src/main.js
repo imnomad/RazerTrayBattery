@@ -54,6 +54,12 @@ const configPath = path.join(
   'config.json'
 );
 
+const cachePath = path.join(
+  process.env.LOCALAPPDATA || '',
+  'RazerTrayBattery',
+  'cache.json'
+);
+
 // Styles: 'lowest_classic', 'lowest_silhouette', 'silhouettes', 'dark', 'shapes', 'badges', 'combined'
 let currentStyle = 'silhouettes';
 
@@ -74,7 +80,33 @@ function saveConfig() {
   } catch (_) {}
 }
 
+function loadBatteryCache() {
+  try {
+    if (fs.existsSync(cachePath)) {
+      const data = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+      if (data && typeof data === 'object') {
+        for (const [k, v] of Object.entries(data)) {
+          if (v && typeof v.percent === 'number' && v.percent > 0) {
+            batteryCache.set(k, v);
+          }
+        }
+      }
+    }
+  } catch (_) {}
+}
+
+function saveBatteryCache() {
+  try {
+    const obj = {};
+    for (const [k, v] of batteryCache.entries()) {
+      obj[k] = v;
+    }
+    fs.writeFileSync(cachePath, JSON.stringify(obj, null, 2), 'utf8');
+  } catch (_) {}
+}
+
 loadConfig();
+loadBatteryCache();
 
 async function setStyle(newStyle) {
   if (currentStyle === newStyle) return;
@@ -592,6 +624,7 @@ function createDeviceIcon(deviceType, percent, charging) {
    ========================= */
 
 function readSynapseBatteries() {
+  const result = {};
   try {
     const logsDir = path.join(
       process.env.LOCALAPPDATA || '',
@@ -600,29 +633,24 @@ function readSynapseBatteries() {
       'User Data',
       'Logs'
     );
-    if (!fs.existsSync(logsDir)) return {};
+    if (!fs.existsSync(logsDir)) return result;
 
-    // Find all systray log files (systray_systrayv2.log, systray_systrayv21.log, etc.)
-    const files = fs.readdirSync(logsDir)
-      .filter(f => f.toLowerCase().startsWith('systray_systray') && f.toLowerCase().endsWith('.log'))
-      .map(f => {
-        const full = path.join(logsDir, f);
-        try {
-          const stat = fs.statSync(full);
-          return { full, mtime: stat.mtimeMs, size: stat.size };
-        } catch {
-          return null;
-        }
-      })
-      .filter(Boolean)
+    const allFiles = fs.readdirSync(logsDir).map(f => {
+      const full = path.join(logsDir, f);
+      try {
+        const stat = fs.statSync(full);
+        return { name: f, full, mtime: stat.mtimeMs, size: stat.size };
+      } catch {
+        return null;
+      }
+    }).filter(Boolean);
+
+    // 1. Scan recent systray logs (up to 5 recent files, scanning multiple lines without premature break)
+    const systrayFiles = allFiles
+      .filter(f => f.name.toLowerCase().startsWith('systray_systray') && f.name.endsWith('.log'))
       .sort((a, b) => b.mtime - a.mtime);
 
-    if (files.length === 0) return {};
-
-    const result = {};
-
-    // Read up to 3 most recently modified systray logs
-    for (const fileObj of files.slice(0, 3)) {
+    for (const fileObj of systrayFiles.slice(0, 5)) {
       try {
         const readSize = Math.min(fileObj.size, 512 * 1024);
         if (readSize <= 0) continue;
@@ -641,30 +669,70 @@ function readSynapseBatteries() {
               const parsed = JSON.parse(raw);
               for (const item of parsed) {
                 if (item && item.hasBattery && item.powerStatus && item.productId) {
-                  if (!result[item.productId]) {
-                    result[item.productId] = {
+                  const pid = item.productId;
+                  if (!result[pid] && typeof item.powerStatus.level === 'number' && item.powerStatus.level > 0) {
+                    result[pid] = {
                       level: item.powerStatus.level,
                       charging: item.powerStatus.chargingStatus === 'Charging',
                       name: item.name?.en || item.productName?.en,
-                      productId: item.productId
+                      productId: pid
                     };
                   }
                 }
               }
             } catch (_) {}
-            if (Object.keys(result).length > 0) {
-              break;
-            }
           }
         }
       } catch (_) {}
+    }
 
-      if (Object.keys(result).length > 0) break;
+    // 2. Also check dedicated product log files (e.g. products_631_mw*, products_229_mw*)
+    // for any devices that were not found in recent systray logs
+    const productFiles = allFiles
+      .filter(f => f.name.startsWith('products_') && f.name.includes('_mw') && f.name.endsWith('.log'))
+      .sort((a, b) => b.mtime - a.mtime);
+
+    for (const pf of productFiles) {
+      const m = pf.name.match(/products_(\d+)_mw/);
+      if (!m) continue;
+      const pid = Number(m[1]);
+      if (result[pid]) continue; // already found with positive level
+
+      try {
+        const readSize = Math.min(pf.size, 256 * 1024);
+        if (readSize <= 0) continue;
+        const buffer = Buffer.alloc(readSize);
+        const fd = fs.openSync(pf.full, 'r');
+        fs.readSync(fd, buffer, 0, readSize, pf.size - readSize);
+        fs.closeSync(fd);
+
+        const content = buffer.toString('utf-8');
+        const lines = content.split('\n');
+        for (let i = lines.length - 1; i >= 0; i--) {
+          const line = lines[i];
+          if (line.includes('GET_BATTERY_STATE')) {
+            const jsonIdx = line.indexOf('GET_BATTERY_STATE');
+            const raw = line.slice(jsonIdx + 'GET_BATTERY_STATE'.length).trim();
+            try {
+              const parsed = JSON.parse(raw);
+              if (parsed && typeof parsed.level === 'number' && parsed.level > 0) {
+                result[pid] = {
+                  level: parsed.level,
+                  charging: parsed.chargingStatus === 'Charging',
+                  name: pid === 631 ? 'Razer Pro Type Ultra' : (pid === 229 ? 'Razer Viper V4 Pro' : `Razer Device ${pid}`),
+                  productId: pid
+                };
+                break;
+              }
+            } catch (_) {}
+          }
+        }
+      } catch (_) {}
     }
 
     return result;
   } catch (_) {}
-  return {};
+  return result;
 }
 
 /* =========================
@@ -844,6 +912,7 @@ async function getDeviceBattery(device) {
         charging: item.charging
       };
       batteryCache.set(device.key, { ...res, timestamp: Date.now() });
+      saveBatteryCache();
       return res;
     }
   }
@@ -856,15 +925,16 @@ async function getDeviceBattery(device) {
       charging: false
     };
     batteryCache.set(device.key, { ...res, timestamp: Date.now() });
+    saveBatteryCache();
     return res;
   }
 
   // 3. Cached battery fallback if device is still connected
   const cached = batteryCache.get(device.key);
-  if (cached && (Date.now() - cached.timestamp < 24 * 60 * 60 * 1000)) {
+  if (cached && typeof cached.percent === 'number' && cached.percent > 0) {
     return {
       percent: cached.percent,
-      charging: cached.charging
+      charging: Boolean(cached.charging)
     };
   }
 
@@ -1049,7 +1119,10 @@ async function updateAllTrays() {
   // Fetch live battery for each device
   const listWithBat = [];
   for (const device of batteryDevices) {
-    const bat = await getDeviceBattery(device);
+    let bat = await getDeviceBattery(device);
+    if (!bat && batteryCache.has(device.key)) {
+      bat = batteryCache.get(device.key);
+    }
     listWithBat.push({
       ...device,
       percent: bat ? bat.percent : 0,
