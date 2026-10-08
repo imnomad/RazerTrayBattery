@@ -25,6 +25,15 @@ function handleSquirrel() {
 }
 if (handleSquirrel()) return;
 
+const gotSingleLock = app.requestSingleInstanceLock();
+if (!gotSingleLock) {
+  app.quit();
+  return;
+}
+app.on('second-instance', () => {
+  openSettings();
+});
+
 const RAZER_VENDOR_ID = 0x1532;
 const logFile = path.join(
   process.env.LOCALAPPDATA || (app && app.getPath ? app.getPath('userData') : '.'),
@@ -623,7 +632,7 @@ function createDeviceIcon(deviceType, percent, charging) {
    SYNAPSE LOG READER
    ========================= */
 
-function readSynapseBatteries() {
+function readSynapseBatteries(maxAgeMs = 30 * 60 * 1000) {
   const result = {};
   try {
     const logsDir = path.join(
@@ -643,7 +652,7 @@ function readSynapseBatteries() {
       } catch {
         return null;
       }
-    }).filter(Boolean);
+    }).filter(f => f && (!maxAgeMs || (Date.now() - f.mtime) <= maxAgeMs));
 
     // 1. Scan recent systray logs (up to 5 recent files, scanning multiple lines without premature break)
     const systrayFiles = allFiles
@@ -868,7 +877,7 @@ function refreshDevices() {
   }
 
   // 2. Also import any battery devices tracked by Razer Synapse
-  const synapseData = readSynapseBatteries();
+  const synapseData = readSynapseBatteries(0);
   for (const [pidStr, item] of Object.entries(synapseData)) {
     const pid = Number(pidStr);
     const devName = item.name || 'Razer Device';
@@ -898,9 +907,27 @@ function refreshDevices() {
 
 async function getDeviceBattery(device) {
   if (!device || !device.hasBattery) return null;
+  log(`getDeviceBattery query: ${device.productName} (PID 0x${device.productId.toString(16)})`);
 
-  // 1. Try Synapse live data first
-  const synapseData = readSynapseBatteries();
+  // 1. Direct WebUSB query first (real-time live hardware query)
+  try {
+    const direct = await readBatteryWebUSB(device);
+    if (direct != null) {
+      const res = {
+        percent: typeof direct === 'object' ? direct.percent : direct,
+        charging: typeof direct === 'object' ? Boolean(direct.charging) : false
+      };
+      log(`WebUSB success for ${device.productName}: ${res.percent}%`);
+      batteryCache.set(device.key, { ...res, timestamp: Date.now() });
+      saveBatteryCache();
+      return res;
+    }
+  } catch (err) {
+    log(`WebUSB exception for ${device.productName}: ${err.message}`);
+  }
+
+  // 2. Fresh Synapse live data fallback (only logs modified within the last 30 minutes)
+  const synapseData = readSynapseBatteries(30 * 60 * 1000);
   const devCanonical = getDeviceCanonicalKey(device.productName, device.vendorId, device.productId);
 
   for (const item of Object.values(synapseData)) {
@@ -915,18 +942,6 @@ async function getDeviceBattery(device) {
       saveBatteryCache();
       return res;
     }
-  }
-
-  // 2. Direct WebUSB communication fallback
-  const direct = await readBatteryWebUSB(device);
-  if (direct != null) {
-    const res = {
-      percent: direct,
-      charging: false
-    };
-    batteryCache.set(device.key, { ...res, timestamp: Date.now() });
-    saveBatteryCache();
-    return res;
   }
 
   // 3. Cached battery fallback if device is still connected
@@ -1383,70 +1398,139 @@ async function readBatteryWebUSB(info) {
     await device.open();
     if (!device.configuration) await device.selectConfiguration(1);
 
-    const transactionId = 0x1f;
-    let msg = Buffer.from([
-      0x00,
-      transactionId,
-      0x00, 0x00,
-      0x00,
-      0x02,
-      0x07,
-      0x80
-    ]);
-
-    let crc = 0;
-    for (let i = 2; i < msg.length; i++) crc ^= msg[i];
-
-    msg = Buffer.concat([
-      msg,
-      Buffer.alloc(80),
-      Buffer.from([crc, 0x00])
-    ]);
+    // Keyboard dongles often require bit 7 set in transaction ID (0x9f), while mice use 0x1f
+    const tids = (info.deviceType === 'keyboard' || info.productId === 0x027b || info.productId === 0x0277)
+      ? [0x9f, 0x1f, 0x80]
+      : [0x1f, 0x9f, 0x80];
 
     let raw = null;
+    let isCharging = false;
+    let workingIface = null;
+    let workingTid = null;
+
     const ifaces = device.configuration ? device.configuration.interfaces : [];
 
     for (const ifaceObj of ifaces) {
       const iface = ifaceObj.interfaceNumber;
+      for (const transactionId of tids) {
+        try {
+          let msg = Buffer.from([
+            0x00,
+            transactionId,
+            0x00, 0x00,
+            0x00,
+            0x02,
+            0x07, // Class (Power)
+            0x80  // Command (Get Battery Level)
+          ]);
+
+          let crc = 0;
+          for (let i = 2; i < msg.length; i++) crc ^= msg[i];
+
+          msg = Buffer.concat([
+            msg,
+            Buffer.alloc(80),
+            Buffer.from([crc, 0x00])
+          ]);
+
+          await device.claimInterface(iface);
+          await device.controlTransferOut({
+            requestType: 'class',
+            recipient: 'interface',
+            request: 0x09,
+            value: 0x300,
+            index: iface
+          }, msg);
+
+          await new Promise(r => setTimeout(r, 60));
+
+          const reply = await device.controlTransferIn({
+            requestType: 'class',
+            recipient: 'interface',
+            request: 0x01,
+            value: 0x300,
+            index: iface
+          }, 90);
+
+          await device.releaseInterface(iface);
+
+          if (reply && reply.data && reply.data.byteLength >= 10) {
+            const status = reply.data.getUint8(0);
+            const val = reply.data.getUint8(9);
+            if (status === 2 && val > 0 && val <= 255) {
+              raw = val;
+              workingIface = iface;
+              workingTid = transactionId;
+              break;
+            }
+          }
+        } catch (_) {
+          try { await device.releaseInterface(iface); } catch (__) {}
+        }
+      }
+      if (raw != null) break;
+    }
+
+    // If battery read succeeded, also check charging status (Command 0x84)
+    if (raw != null && workingIface != null && workingTid != null) {
       try {
-        await device.claimInterface(iface);
+        let chargeMsg = Buffer.from([
+          0x00,
+          workingTid,
+          0x00, 0x00,
+          0x00,
+          0x02,
+          0x07,
+          0x84 // Get Device Charging Status
+        ]);
+        let crc = 0;
+        for (let i = 2; i < chargeMsg.length; i++) crc ^= chargeMsg[i];
+        chargeMsg = Buffer.concat([
+          chargeMsg,
+          Buffer.alloc(80),
+          Buffer.from([crc, 0x00])
+        ]);
+
+        await device.claimInterface(workingIface);
         await device.controlTransferOut({
           requestType: 'class',
           recipient: 'interface',
           request: 0x09,
           value: 0x300,
-          index: iface
-        }, msg);
+          index: workingIface
+        }, chargeMsg);
 
-        await new Promise(r => setTimeout(r, 100));
+        await new Promise(r => setTimeout(r, 60));
 
-        const reply = await device.controlTransferIn({
+        const chargeReply = await device.controlTransferIn({
           requestType: 'class',
           recipient: 'interface',
           request: 0x01,
           value: 0x300,
-          index: iface
+          index: workingIface
         }, 90);
 
-        await device.releaseInterface(iface);
+        await device.releaseInterface(workingIface);
 
-        if (reply && reply.data && reply.data.byteLength >= 10) {
-          const status = reply.data.getUint8(0);
-          const val = reply.data.getUint8(9);
-          if (status === 2 && val > 0 && val <= 255) {
-            raw = val;
-            break;
+        if (chargeReply && chargeReply.data && chargeReply.data.byteLength >= 10) {
+          const status = chargeReply.data.getUint8(0);
+          const cVal = chargeReply.data.getUint8(9);
+          if (status === 2 && cVal === 1) {
+            isCharging = true;
           }
         }
       } catch (_) {
-        try { await device.releaseInterface(iface); } catch (__) {}
+        try { await device.releaseInterface(workingIface); } catch (__) {}
       }
     }
 
     await device.close();
 
     if (raw == null) return null;
-    return Math.round((raw / 255) * 100);
+    return {
+      percent: Math.round((raw / 255) * 100),
+      charging: isCharging
+    };
   } catch {
     return null;
   }
